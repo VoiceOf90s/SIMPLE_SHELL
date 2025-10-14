@@ -25,9 +25,13 @@
     cd SIMPLE_SHELL
 
 2.  Сконфигурируйте и соберите проект с помощью CMake:
+   
     mkdir build
+    
     cd build
+    
     cmake ..
+    
     make
 
 3.  Запустите оболочку:
