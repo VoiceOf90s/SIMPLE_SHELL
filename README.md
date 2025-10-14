@@ -20,7 +20,7 @@
 
 1.  Клонируйте репозиторий:
    
-    git clone github.com/VoiceOf90s/SIMPLE_SHELL
+    git clone https://github.com/VoiceOf90s/SIMPLE_SHELL
     
     cd SIMPLE_SHELL
 
