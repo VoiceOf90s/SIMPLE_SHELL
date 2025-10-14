@@ -19,17 +19,18 @@
 ### Инструкция
 
 1.  Клонируйте репозиторий:
+   
     git clone github.com/VoiceOf90s/SIMPLE_SHELL
     
     cd SIMPLE_SHELL
 
-3.  Сконфигурируйте и соберите проект с помощью CMake:
+2.  Сконфигурируйте и соберите проект с помощью CMake:
     mkdir build
     cd build
     cmake ..
     make
 
-4.  Запустите оболочку:
+3.  Запустите оболочку:
     Исполняемый файл SimpleShell будет находиться в директории build.
     ./SimpleShell
 
