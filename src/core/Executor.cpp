@@ -1,128 +1,175 @@
 #include "core/Executor.h"
+#include "core/BuiltinCommands.h"
 #include "utils/Logger.h"
 #include "utils/CustomException.h"
 #include <iostream>
-#include <algorithm>
+#include <vector>
 
 #ifdef _WIN32
     #include <windows.h>
-    #include <sstream>
+    #include <process.h>
+    #include <fcntl.h>
+    #include <io.h>
     #define NOMINMAX
 #else
     #include <unistd.h>
     #include <sys/wait.h>
+    #include <fcntl.h>
     #include <cstring>
-    #include <cstdlib>
 #endif
 
 namespace Executor {
 
-    bool execute(const Command& command) {
-        if (command.program.empty()) {
+    bool execute(const Pipeline& pipeline) {
+        if (pipeline.commands.empty()) {
             return true;
         }
 
-        Logger::getInstance().log("Executor", "Выполнение команды '" + command.program + "'");
-
-        // Встроенные команды (кроссплатформные)
-        if (command.program == "exit") {
-            Logger::getInstance().log("Executor", "Получена команда 'exit'. Завершение работы.");
-            return false;
-        }
+        const Command& firstCmd = pipeline.commands[0];
         
-        if (command.program == "cd") {
-            executeCdCommand(command);
-            return true;
+        // Если встроенная команда и это простая команда (не конвейер)
+        if (pipeline.isSimple() && BuiltinCommands::isBuiltin(firstCmd.program)) {
+            Logger::getInstance().log("Executor", 
+                "Встроенная команда: " + firstCmd.program);
+            return BuiltinCommands::execute(firstCmd);
         }
 
-        if (command.program == "pwd") {
-            executePwdCommand();
-            return true;
+        // Если это конвейер
+        if (!pipeline.isSimple()) {
+            return executePipeline(pipeline);
         }
 
-        // Внешние команды
-        executeExternalCommand(command);
+        // Внешняя команда
+        executeExternalCommand(firstCmd);
         return true;
     }
 
-
-    void executeCdCommand(const Command& command) {
-        if (command.arguments.empty()) {
-            Logger::getInstance().log("Executor::cd", "Ошибка: не указана директория для 'cd'.");
-            std::cerr << "cd: ожидается аргумент" << std::endl;
-            return;
-        }
-
-        #ifdef _WIN32
-            if (!SetCurrentDirectoryA(command.arguments[0].c_str())) {
-                Logger::getInstance().log("Executor::cd", "Ошибка при смене директории");
-                std::cerr << "cd: не удалось изменить директорию на '" 
-                          << command.arguments[0] << "'" << std::endl;
-            }
-        #else
-            if (chdir(command.arguments[0].c_str()) != 0) {
-                perror("cd");
-                Logger::getInstance().log("Executor::cd", 
-                    "Ошибка при смене директории на '" + command.arguments[0] + "'");
-            }
-        #endif
-        else {
-            Logger::getInstance().log("Executor::cd", 
-                "Успешная смена директории на '" + command.arguments[0] + "'");
-        }
-    }
-
-
-    void executePwdCommand() {
-        char cwd[1024];
-        #ifdef _WIN32
-            if (GetCurrentDirectoryA(sizeof(cwd), cwd)) {
-                std::cout << cwd << std::endl;
-                Logger::getInstance().log("Executor::pwd", std::string(cwd));
-            } else {
-                std::cerr << "pwd: ошибка получения текущей директории" << std::endl;
-            }
-        #else
-            if (getcwd(cwd, sizeof(cwd)) != nullptr) {
-                std::cout << cwd << std::endl;
-                Logger::getInstance().log("Executor::pwd", std::string(cwd));
-            } else {
-                perror("pwd");
-            }
-        #endif
-    }
-
-
     #ifdef _WIN32
+    
+    bool executePipeline(const Pipeline& pipeline) {
+        Logger::getInstance().log("Executor(Windows)", 
+            "Выполнение конвейера из " + std::to_string(pipeline.commandCount()) + 
+            " команд");
+        
+        std::vector<HANDLE> pipes;
+        std::vector<PROCESS_INFORMATION> processes;
+
+        try {
+            // Создаем трубы между командами
+            for (size_t i = 0; i < pipeline.commandCount() - 1; ++i) {
+                HANDLE hRead, hWrite;
+                SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+
+                if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+                    throw CustomException("Не удалось создать pipe в Windows");
+                }
+
+                pipes.push_back(hRead);
+                pipes.push_back(hWrite);
+            }
+
+            // Запускаем каждую команду
+            for (size_t i = 0; i < pipeline.commandCount(); ++i) {
+                const Command& cmd = pipeline.commands[i];
+                
+                std::string cmdLine = cmd.program;
+                for (const auto& arg : cmd.arguments) {
+                    cmdLine += " \"" + arg + "\"";
+                }
+
+                STARTUPINFOA si = { sizeof(STARTUPINFOA) };
+                si.dwFlags = STARTF_USESTDHANDLES;
+
+                // Установка stdin
+                if (i > 0) {
+                    si.hStdInput = pipes[(i - 1) * 2];  // Чтение из предыдущей трубы
+                } else {
+                    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+                }
+
+                // Установка stdout
+                if (i < pipeline.commandCount() - 1) {
+                    si.hStdOutput = pipes[i * 2 + 1];  // Запись в трубу
+                } else {
+                    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+                }
+
+                si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+                PROCESS_INFORMATION pi = {};
+                std::string cmdLineCopy = cmdLine;
+
+                if (!CreateProcessA(nullptr, &cmdLineCopy[0], nullptr, nullptr, 
+                                   TRUE, 0, nullptr, nullptr, &si, &pi)) {
+                    throw CustomException("Не удалось запустить команду: " + cmd.program);
+                }
+
+                processes.push_back(pi);
+                Logger::getInstance().log("Executor(Windows)", 
+                    "Запущена команда: " + cmd.program + " (PID: " + 
+                    std::to_string(pi.dwProcessId) + ")");
+
+                CloseHandle(pi.hThread);
+            }
+
+            // Закрываем все трубы в родительском процессе
+            for (auto pipe : pipes) {
+                CloseHandle(pipe);
+            }
+
+            // Ждем завершения всех процессов
+            for (const auto& pi : processes) {
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                DWORD exitCode;
+                GetExitCodeProcess(pi.hProcess, &exitCode);
+                Logger::getInstance().log("Executor(Windows)", 
+                    "Процесс завершился с кодом " + std::to_string(exitCode));
+                CloseHandle(pi.hProcess);
+            }
+
+        } catch (const std::exception& e) {
+            Logger::getInstance().log("Executor(Windows)", 
+                std::string("Ошибка при выполнении конвейера: ") + e.what());
+            
+            // Закрываем оставшиеся ресурсы
+            for (auto pipe : pipes) {
+                CloseHandle(pipe);
+            }
+            for (const auto& pi : processes) {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hProcess);
+            }
+            throw;
+        }
+
+        return true;
+    }
+
     void executeExternalCommand(const Command& command) {
         std::string cmdLine = command.program;
         for (const auto& arg : command.arguments) {
-            cmdLine += " " + arg;
+            cmdLine += " \"" + arg + "\"";
         }
 
         Logger::getInstance().log("Executor(Windows)", 
-            "Выполнение команды: " + cmdLine);
+            "Выполнение внешней команды: " + cmdLine);
 
         STARTUPINFOA si = { sizeof(STARTUPINFOA) };
         PROCESS_INFORMATION pi = {};
 
-        // Модифицируем строку, так как CreateProcessA требует неконстантный указатель
         std::string cmdLineCopy = cmdLine;
         
-        if (!CreateProcessA(
-            nullptr,
-            &cmdLineCopy[0],
-            nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-            
+        if (!CreateProcessA(nullptr, &cmdLineCopy[0], nullptr, nullptr, FALSE, 0, 
+                           nullptr, nullptr, &si, &pi)) {
             Logger::getInstance().log("Executor(Windows)", 
-                "Ошибка CreateProcess для команды '" + command.program + "'");
-            std::cerr << "Ошибка: не удалось запустить команду '" 
-                      << command.program << "'" << std::endl;
+                "Ошибка CreateProcess для " + command.program);
+            std::cerr << "Ошибка: не удалось запустить '" << command.program << "'" 
+                      << std::endl;
             return;
         }
 
         Logger::getInstance().log("Executor(Windows)", 
-            "Ожидание завершения процесса PID: " + std::to_string(pi.dwProcessId));
+            "Процесс запущен с PID: " + std::to_string(pi.dwProcessId));
 
         WaitForSingleObject(pi.hProcess, INFINITE);
 
@@ -136,13 +183,106 @@ namespace Executor {
         CloseHandle(pi.hThread);
     }
 
-    #else  // POSIX системы (Linux, macOS)
+    #else  // POSIX (Linux, macOS)
+
+    bool executePipeline(const Pipeline& pipeline) {
+        Logger::getInstance().log("Executor(POSIX)", 
+            "Выполнение конвейера из " + std::to_string(pipeline.commandCount()) + 
+            " команд");
+
+        std::vector<pid_t> pids;
+        int prevPipeRead = -1;  // Дескриптор чтения из предыдущей трубы
+
+        for (size_t i = 0; i < pipeline.commandCount(); ++i) {
+            int pipeFds[2] = {-1, -1};
+
+            // Создаем трубу, если это не последняя команда
+            if (i < pipeline.commandCount() - 1) {
+                if (pipe(pipeFds) == -1) {
+                    perror("pipe");
+                    throw CustomException("Не удалось создать pipe");
+                }
+            }
+
+            pid_t pid = fork();
+
+            if (pid < 0) {
+                throw CustomException("Не удалось создать дочерний процесс");
+            }
+            else if (pid == 0) {
+                // Дочерний процесс
+
+                // Перенаправляем stdin с предыдущей трубы (если не первая команда)
+                if (i > 0) {
+                    dup2(prevPipeRead, STDIN_FILENO);
+                    close(prevPipeRead);
+                }
+
+                // Перенаправляем stdout в трубу (если не последняя команда)
+                if (i < pipeline.commandCount() - 1) {
+                    dup2(pipeFds[1], STDOUT_FILENO);
+                    close(pipeFds[0]);
+                    close(pipeFds[1]);
+                }
+
+                // Подготовляем аргументы для execvp
+                const Command& cmd = pipeline.commands[i];
+                std::vector<char*> argv;
+                argv.push_back(const_cast<char*>(cmd.program.c_str()));
+                for (const auto& arg : cmd.arguments) {
+                    argv.push_back(const_cast<char*>(arg.c_str()));
+                }
+                argv.push_back(nullptr);
+
+                execvp(argv[0], argv.data());
+
+                perror("execvp");
+                Logger::getInstance().log("Executor(Child)", 
+                    "Ошибка execvp для " + cmd.program);
+                _exit(EXIT_FAILURE);
+            }
+            else {
+                // Родительский процесс
+                pids.push_back(pid);
+
+                // Закрываем трубы в родителе
+                if (prevPipeRead != -1) {
+                    close(prevPipeRead);
+                }
+                if (i < pipeline.commandCount() - 1) {
+                    close(pipeFds[1]);
+                    prevPipeRead = pipeFds[0];
+                }
+
+                Logger::getInstance().log("Executor(Parent)", 
+                    "Запущена команда " + pipeline.commands[i].program + 
+                    " (PID: " + std::to_string(pid) + ")");
+            }
+        }
+
+        // Закрываем оставшуюся трубу
+        if (prevPipeRead != -1) {
+            close(prevPipeRead);
+        }
+
+        // Ждем завершения всех дочерних процессов
+        int status;
+        for (pid_t pid : pids) {
+            waitpid(pid, &status, 0);
+            Logger::getInstance().log("Executor(Parent)", 
+                "Процесс " + std::to_string(pid) + " завершился с кодом " + 
+                std::to_string(WEXITSTATUS(status)));
+        }
+
+        return true;
+    }
+
     void executeExternalCommand(const Command& command) {
         pid_t pid = fork();
 
         if (pid < 0) {
-            throw CustomException("Не удалось создать дочерний процесс (fork failed).");
-        } 
+            throw CustomException("Не удалось создать дочерний процесс");
+        }
         else if (pid == 0) {
             // Дочерний процесс
             std::vector<char*> argv;
@@ -154,23 +294,21 @@ namespace Executor {
 
             execvp(argv[0], argv.data());
 
-            // Если execvp вернулся - это ошибка
             perror("execvp");
             Logger::getInstance().log("Executor(Child)", 
-                "Ошибка execvp для команды '" + command.program + "'");
+                "Ошибка execvp для " + command.program);
             _exit(EXIT_FAILURE);
-        } 
+        }
         else {
             // Родительский процесс
             Logger::getInstance().log("Executor(Parent)", 
-                "Ожидание завершения дочернего процесса PID: " + std::to_string(pid));
+                "Ожидание завершения процесса PID: " + std::to_string(pid));
+            
             int status;
             waitpid(pid, &status, 0);
             Logger::getInstance().log("Executor(Parent)", 
-                "Дочерний процесс " + std::to_string(pid) + 
-                " завершился с кодом " + std::to_string(WEXITSTATUS(status)));
+                "Процесс завершился с кодом " + std::to_string(WEXITSTATUS(status)));
         }
     }
-    #endif
 
-}
+    #endif
